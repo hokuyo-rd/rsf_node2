@@ -1,0 +1,3 @@
+[submodule "rsf_library"]
+	path = rsf_library
+	url = https://github.com/hokuyo-rd/rsf_library.git
