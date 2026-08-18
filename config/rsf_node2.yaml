@@ -1,0 +1,66 @@
+# Parameters for the rsf_node executable of the rsf_node2 package.
+# The top-level key has to match the node name set in the launch file.
+rsf_node:
+  ros__parameters:
+    # ---- Connection ----
+    ip_address: "192.168.0.100"
+    port: 10940
+
+    # Commands issued once the connection comes up (section 3.4 state diagram).
+    # Streaming has to be started before position estimation.
+    start_streaming_on_connect: true
+    start_rsf_on_connect: true
+
+    # Wire dialect: "auto" detects it from the incoming frames, "spec" and
+    # "legacy" pin it. See rsf_library/README.md for why both exist.
+    wire_layout: "legacy"
+
+    # Publisher queue depth. The 1 kHz streams need more than the usual 10.
+    queue_size: 100
+
+    # ---- TF ----
+    broadcast_tf: true
+    # Odometry arrives at 1 kHz; one transform is sent per this many messages.
+    tf_decimation: 50
+
+    odom_frame: "rsf_odom"
+    utm_frame: "rsf_utm/utm"
+    lidar_frame: "rsf_hokuyo3d"
+    imu_frame: "rsf_hokuyo3d_imu"
+    gnss_frame: "rsf_gnss"
+
+    # ---- Published topics ----
+    # Sensor data
+    fix_topic: "/rsf/nav_sat_fix"
+    gga_topic: "/rsf/gpgga"
+    rmc_topic: "/rsf/gprmc"
+    zda_topic: "/rsf/gpzda"
+    point_cloud_topic: "/rsf/hokuyo_cloud2"
+    imu_topic: "/rsf/imu"
+
+    # Position estimation data
+    lio_odom_topic: "/rsf/lio_imu_rate_odom"
+    switch_fix_topic: "/rsf/rsf_fix"
+    utm_odom_topic: "/rsf/utm_coord_odom"
+    switch_odom_topic: "/rsf/rsf_odom"
+    switch_odom_state_topic: "/rsf/rsf_odom_state"
+    switch_odom_type_topic: "/rsf/rsf_odom_type"
+    switch_fix_state_topic: "/rsf/rsf_fix_state"
+    switch_fix_type_topic: "/rsf/rsf_fix_type"
+
+    # Diagnostics
+    diagnostics_topic: "/rsf/diagnostics"
+    diagnostic_status_name: "rsf_device"
+
+    # The latest LIO odometry, re-published at point cloud rate so that a
+    # consumer of the cloud has a pose sampled at the same moment.
+    publish_lidar_rate_odom: true
+    lidar_rate_odom_topic: "/rsf/lio_lidar_rate_odom"
+
+    # ---- Subscribed topics ----
+    command_topic: "/rsf/cmd_to_spel"
+
+    # SET_IP_ADDRESS is not part of C-42-04636 and is only accepted by some
+    # firmware builds. Leave this off unless the sensor is known to support it.
+    enable_set_ip_address: false
+    set_ip_address_topic: "/rsf/ip_address"
