@@ -54,31 +54,37 @@ find_package(nmea_msgs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 
+# Linked as imported targets rather than through ament_target_dependencies():
+# that macro uses the plain target_link_libraries() signature, which cannot be
+# mixed with the keyword (PRIVATE) signature used below, and it is deprecated
+# from ROS 2 Jazzy on. Message packages export their interfaces as
+# ${<pkg>_TARGETS}.
 set(ROS_DEPENDENCIES
-  rclcpp
-  std_msgs
-  sensor_msgs
-  geometry_msgs
-  nav_msgs
-  nmea_msgs
-  diagnostic_msgs
-  tf2_ros)
+  rclcpp::rclcpp
+  tf2_ros::tf2_ros
+  ${std_msgs_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${nmea_msgs_TARGETS}
+  ${diagnostic_msgs_TARGETS})
 
 # ******************** Driver node ********************
 
 add_executable(rsf_node src/rsf_node.cpp)
 target_include_directories(rsf_node PRIVATE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
-target_link_libraries(rsf_node PRIVATE rsf_library)
-ament_target_dependencies(rsf_node ${ROS_DEPENDENCIES})
+target_link_libraries(rsf_node PRIVATE rsf_library ${ROS_DEPENDENCIES})
 
 # ******************** Command sender ********************
 
 add_executable(send_command src/send_command.cpp)
 target_include_directories(send_command PRIVATE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
-target_link_libraries(send_command PRIVATE rsf_library)
-ament_target_dependencies(send_command rclcpp std_msgs)
+target_link_libraries(send_command PRIVATE
+  rsf_library
+  rclcpp::rclcpp
+  ${std_msgs_TARGETS})
 
 # ******************** Install ********************
 
