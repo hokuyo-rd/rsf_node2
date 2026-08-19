@@ -76,6 +76,34 @@ struct DriverConfig {
   // Publisher queue depth. The 1 kHz streams need more than the usual 10.
   int queue_size = 100;
 
+  // Depth of the node's own hand-off queue between the sensor receive thread
+  // and the thread that calls publish(). A rclcpp publisher can block - a
+  // RELIABLE writer whose history is full waits for its subscribers - and with
+  // every topic published inline on the receive thread that stalled the whole
+  // node and backed the sensor socket up. Roughly 0.3 s of traffic at the
+  // combined ~7 kHz output rate.
+  int publish_queue_size = 2000;
+
+  // The four state/type strings of sections 3.8.8/3.8.9 arrive at 1 kHz but
+  // change only every few seconds, so by default they are published when the
+  // text changes and otherwise at `text_keepalive_hz`, which takes about 4000
+  // messages a second out of the graph. Set false to forward every one.
+  bool publish_text_on_change_only = true;
+  double text_keepalive_hz = 1.0;
+
+  // One odometry message is published per this many received, per source.
+  // 1 publishes every sample, 10 gives roughly 100 Hz out of the 1 kHz stream.
+  //
+  // Counting samples rather than watching the clock is deliberate: the sensor
+  // delivers the 1 kHz streams in bursts of about fifty, so a wall-clock rate
+  // limiter throws most of each burst away and lands near 180 Hz whatever it is
+  // set to. Decimation is exact and independent of how the data is batched,
+  // which is also why tf_decimation is expressed the same way.
+  //
+  // Applies to lio_odom, switch_odom and utm_odom. TF has its own decimation,
+  // and IMU is left alone.
+  int odom_decimation = 1;
+
   // Name reported in diagnostic_msgs/DiagnosticStatus::name.
   std::string diagnostic_status_name = "rsf_device";
 
@@ -121,6 +149,15 @@ struct DriverConfig {
     }
     if (queue_size < 1) {
       return "queue_size must be at least 1";
+    }
+    if (publish_queue_size < 1) {
+      return "publish_queue_size must be at least 1";
+    }
+    if (text_keepalive_hz < 0.0) {
+      return "text_keepalive_hz must not be negative";
+    }
+    if (odom_decimation < 1) {
+      return "odom_decimation must be at least 1";
     }
     return std::string();
   }

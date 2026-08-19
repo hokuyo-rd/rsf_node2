@@ -18,6 +18,17 @@ if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD_REQUIRED ON)
 endif()
 
+# colcon does not set a build type, and CMake then passes no -O flag at all, so
+# the CRC and the point cloud codec end up compiled at -O0. That is not a matter
+# of a few percent here: at 1 kHz on nine streams plus a 20 Hz cloud the receive
+# thread stops keeping up with the sensor, the socket backs up and the stream
+# stalls. Release unless the caller asked for something specific.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+    Debug Release RelWithDebInfo MinSizeRel)
+endif()
+
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()

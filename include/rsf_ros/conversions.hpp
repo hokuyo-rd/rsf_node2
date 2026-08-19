@@ -15,8 +15,12 @@
 
 #pragma once
 
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
+#include <type_traits>
 
 #include "rsf/types.hpp"
 #include "rsf_ros/ros_compat.hpp"
@@ -84,6 +88,25 @@ constexpr std::uint32_t kOffsetIntensity = 12;
 constexpr std::uint32_t kOffsetSec = 16;
 constexpr std::uint32_t kOffsetNsec = 20;
 constexpr std::uint32_t kPointStep = 24;
+
+// POINTXYZIT on the wire, this byte layout, and rsf::PointXYZIT are the same
+// six fields in the same order, all little-endian. Where that holds the points
+// can be copied in one block instead of being taken apart and reassembled field
+// by field; the loop below stays for anything that does not match.
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
+constexpr bool kLittleEndianHost = __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__;
+#elif defined(_WIN32)
+constexpr bool kLittleEndianHost = true;
+#else
+constexpr bool kLittleEndianHost = false;
+#endif
+
+constexpr bool kPointIsBitwiseCompatible =
+    kLittleEndianHost && std::is_standard_layout<rsf::PointXYZIT>::value &&
+    sizeof(rsf::PointXYZIT) == kPointStep && offsetof(rsf::PointXYZIT, x) == kOffsetX &&
+    offsetof(rsf::PointXYZIT, y) == kOffsetY && offsetof(rsf::PointXYZIT, z) == kOffsetZ &&
+    offsetof(rsf::PointXYZIT, intensity) == kOffsetIntensity &&
+    offsetof(rsf::PointXYZIT, sec) == kOffsetSec && offsetof(rsf::PointXYZIT, nsec) == kOffsetNsec;
 }  // namespace point_layout
 
 // sensor_msgs/PointCloud2 with fields x, y, z, intensity, sec, nsec.
@@ -94,8 +117,10 @@ void toPointCloud2Msg(const rsf::PointCloud& cloud, const std::string& frame_id,
 
   msg.height = 1;
   msg.width = static_cast<std::uint32_t>(cloud.points.size());
-  msg.is_dense = true;
   msg.is_bigendian = false;
+  // is_dense is set below, once the points have been looked at. It is a claim
+  // that no point is invalid, and a consumer that believes it skips its own
+  // finiteness check, so it cannot be assumed.
   msg.point_step = point_layout::kPointStep;
   msg.row_step = msg.point_step * msg.width;
 
@@ -117,16 +142,37 @@ void toPointCloud2Msg(const rsf::PointCloud& cloud, const std::string& frame_id,
   // Written field by field in little-endian order, matching is_bigendian above.
   // This avoids depending on the memory layout of rsf::PointXYZIT.
   msg.data.resize(static_cast<std::size_t>(msg.row_step));
-  std::uint8_t* cursor = msg.data.data();
-  for (const rsf::PointXYZIT& point : cloud.points) {
-    rsf::writeF32(cursor + point_layout::kOffsetX, point.x);
-    rsf::writeF32(cursor + point_layout::kOffsetY, point.y);
-    rsf::writeF32(cursor + point_layout::kOffsetZ, point.z);
-    rsf::writeF32(cursor + point_layout::kOffsetIntensity, point.intensity);
-    rsf::writeU32(cursor + point_layout::kOffsetSec, point.sec);
-    rsf::writeU32(cursor + point_layout::kOffsetNsec, point.nsec);
-    cursor += point_layout::kPointStep;
+
+  if (!cloud.points.empty()) {
+    if constexpr (point_layout::kPointIsBitwiseCompatible) {
+      std::memcpy(msg.data.data(), cloud.points.data(),
+                  cloud.points.size() * point_layout::kPointStep);
+    } else {
+      std::uint8_t* cursor = msg.data.data();
+      for (const rsf::PointXYZIT& point : cloud.points) {
+        rsf::writeF32(cursor + point_layout::kOffsetX, point.x);
+        rsf::writeF32(cursor + point_layout::kOffsetY, point.y);
+        rsf::writeF32(cursor + point_layout::kOffsetZ, point.z);
+        rsf::writeF32(cursor + point_layout::kOffsetIntensity, point.intensity);
+        rsf::writeU32(cursor + point_layout::kOffsetSec, point.sec);
+        rsf::writeU32(cursor + point_layout::kOffsetNsec, point.nsec);
+        cursor += point_layout::kPointStep;
+      }
+    }
   }
+
+  // A separate pass, so that the copy above stays a plain block move. is_dense
+  // is a promise that no point is invalid, and a consumer that believes it
+  // skips its own finiteness check, so it has to be measured rather than
+  // asserted.
+  bool dense = true;
+  for (const rsf::PointXYZIT& point : cloud.points) {
+    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
+      dense = false;
+      break;
+    }
+  }
+  msg.is_dense = dense;
 }
 
 // ******************** IMU ********************

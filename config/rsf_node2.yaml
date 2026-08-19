@@ -18,6 +18,29 @@ rsf_node:
     # Publisher queue depth. The 1 kHz streams need more than the usual 10.
     queue_size: 100
 
+    # Depth of the hand-off queue between the sensor receive thread and the
+    # thread that calls publish(). publish() can block when a subscriber falls
+    # behind; this keeps that from stopping the sensor link and every other
+    # topic with it. Overflow discards the oldest samples and is logged.
+    publish_queue_size: 2000
+
+    # The state/type strings arrive at 1 kHz but change every few seconds.
+    # Publishing them only on change, plus a slow keepalive so a late
+    # subscriber still gets the current value, removes about 4000 messages a
+    # second. Set to false to forward every one.
+    publish_text_on_change_only: true
+    text_keepalive_hz: 1.0
+
+    # One odometry message is published per this many received, per source.
+    # 1 publishes every sample (the sensor's full 1 kHz); 10 gives about 100 Hz.
+    #
+    # Counted rather than timed on purpose: the sensor delivers the 1 kHz
+    # streams in bursts of about fifty, so a wall-clock rate limiter discards
+    # most of each burst and lands near 180 Hz whatever rate is asked for.
+    # Applies to lio_odom, switch_odom and utm_odom; TF has tf_decimation and
+    # IMU is left alone.
+    odom_decimation: 10
+
     # ---- TF ----
     broadcast_tf: true
     # Odometry arrives at 1 kHz; one transform is sent per this many messages.

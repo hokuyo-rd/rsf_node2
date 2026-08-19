@@ -64,8 +64,20 @@ fi
 
 xhost +
 
+# On WSL2, passing /dev through is not enough for hardware OpenGL: Mesa's d3d12
+# driver also dlopens the D3D12 user mode libraries, which live in /usr/lib/wsl
+# on the host. Without them it falls back to llvmpipe and renders everything on
+# the CPU, which the RViz point cloud display cannot survive - it keeps
+# Decay Time seconds worth of clouds and redraws all of them every frame.
+WSLG_CMD=""
+if [ -d /usr/lib/wsl/lib ]; then
+    WSLG_CMD="-v /usr/lib/wsl:/usr/lib/wsl:ro -e LD_LIBRARY_PATH=/usr/lib/wsl/lib"
+    echo " WSL GPU libraries found: enabling hardware OpenGL" 1>&2
+fi
+
 docker run -it  $CONTAINER_NAME_CMD \
             -v /dev:/dev \
+            $WSLG_CMD \
             -v /tmp/.X11-unix:/tmp/.X11-unix \
             -v $HOME/.Xauthority:/root/.Xauthority:rw \
             -v /var/run/dbus:/var/run/dbus \

@@ -9,8 +9,17 @@
 // that includes rclcpp.
 //
 // Threading: rsf::Client runs its receive loop on its own thread and the
-// callbacks below are invoked from it. rclcpp publishers are safe to use from
-// any thread, and the callbacks do no blocking work beyond publishing.
+// callbacks below are invoked from it. Those callbacks build the ROS message
+// and hand it to a PublishLane; the actual publish() happens on that lane's
+// own thread, one lane per topic.
+//
+// That separation is not decoration. A rclcpp publisher can block - a RELIABLE
+// writer whose history is full waits for its subscribers - and the node emits
+// thousands of messages a second. With publish() called inline, one slow
+// subscriber stopped every topic at once and stopped the thread draining the
+// TCP socket with them, so the sensor link backed up and data arrived in
+// multi-second bursts. Per-topic lanes confine a blocked writer to its own
+// topic: it loses queued samples there and nothing else is affected.
 
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -26,16 +35,157 @@
 #include <std_msgs/msg/u_int8.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cinttypes>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #include "rsf/rsf.hpp"
 #include "rsf_ros/conversions.hpp"
 #include "rsf_ros/driver_config.hpp"
 
 namespace rsf_node2 {
+
+// One publishing lane: a bounded queue and the thread that drains it.
+//
+// There is a lane per topic rather than one shared queue, because publish() can
+// block for a long time - a RELIABLE writer whose history is full waits for its
+// subscribers - and with a single queue the topic behind a slow subscriber
+// stalls every other topic behind it. A lane confines that to the topic that
+// actually has the slow consumer.
+//
+// The queue discards the oldest entry when full, so a slow subscriber costs
+// samples on its own topic instead of applying back pressure to the sensor
+// link. Discards and the worst observed publish() duration are recorded, so the
+// offending topic can be named instead of guessed at.
+class PublishLane {
+ public:
+  PublishLane(std::string name, std::size_t capacity)
+      : name_(std::move(name)),
+        capacity_(capacity > 0 ? capacity : 1),
+        thread_(&PublishLane::run, this) {}
+
+  ~PublishLane() { stop(); }
+
+  PublishLane(const PublishLane&) = delete;
+  PublishLane& operator=(const PublishLane&) = delete;
+
+  // Never blocks. `work` may hold move-only state such as a unique_ptr message.
+  template <typename Work>
+  void post(Work&& work) {
+    auto job = std::unique_ptr<JobBase>(new Job<std::decay_t<Work>>(std::forward<Work>(work)));
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!running_) {
+        return;
+      }
+      if (jobs_.size() >= capacity_) {
+        jobs_.pop_front();
+        ++dropped_;
+      }
+      jobs_.push_back(std::move(job));
+    }
+    condition_.notify_one();
+  }
+
+  // Stops accepting work and lets the thread finish what is already queued.
+  void stop() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!running_) {
+        return;
+      }
+      running_ = false;
+    }
+    condition_.notify_all();
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+  struct Report {
+    std::string name;
+    std::uint64_t dropped_since = 0;
+    std::size_t depth = 0;
+    double worst_publish_seconds = 0.0;
+  };
+
+  // Returns activity since the previous call and clears the interval counters.
+  Report takeReport() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Report report;
+    report.name = name_;
+    report.dropped_since = dropped_ - reported_;
+    report.depth = jobs_.size();
+    report.worst_publish_seconds = worst_publish_seconds_;
+    reported_ = dropped_;
+    worst_publish_seconds_ = 0.0;
+    return report;
+  }
+
+ private:
+  struct JobBase {
+    virtual ~JobBase() = default;
+    virtual void run() = 0;
+  };
+
+  template <typename Work>
+  struct Job : JobBase {
+    explicit Job(Work&& work) : work(std::move(work)) {}
+    void run() override { work(); }
+    Work work;
+  };
+
+  void run() {
+    for (;;) {
+      std::unique_ptr<JobBase> job;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        condition_.wait(lock, [this] { return !jobs_.empty() || !running_; });
+        if (jobs_.empty()) {
+          return;  // stopped and drained
+        }
+        job = std::move(jobs_.front());
+        jobs_.pop_front();
+      }
+
+      // Outside the lock: this is the call that may block, and timing it is
+      // what turns "something is slow" into a named topic.
+      const auto started = std::chrono::steady_clock::now();
+      job->run();
+      const double seconds =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+      if (seconds > 0.001) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (seconds > worst_publish_seconds_) {
+          worst_publish_seconds_ = seconds;
+        }
+      }
+    }
+  }
+
+  std::string name_;
+
+  mutable std::mutex mutex_;
+  std::condition_variable condition_;
+  std::deque<std::unique_ptr<JobBase>> jobs_;
+  std::size_t capacity_;
+  std::uint64_t dropped_ = 0;
+  std::uint64_t reported_ = 0;
+  double worst_publish_seconds_ = 0.0;
+  bool running_ = true;
+  std::thread thread_;
+};
 
 class RsfNode : public rclcpp::Node {
  public:
@@ -55,6 +205,12 @@ class RsfNode : public rclcpp::Node {
       tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
     }
 
+    createPublishLanes();
+
+    // Reports discarded samples per lane, so a subscriber that cannot keep up
+    // shows up in the log by name instead of as unexplained gaps.
+    report_timer_ = create_wall_timer(std::chrono::seconds(5), [this]() { reportDrops(); });
+
     RCLCPP_INFO(get_logger(), "connecting to RSF-X001 at %s:%d", config_.ip_address.c_str(),
                 config_.port);
 
@@ -63,10 +219,14 @@ class RsfNode : public rclcpp::Node {
   }
 
   ~RsfNode() override {
-    // Stop receiving before the publishers go away.
+    // Stop receiving first, so nothing new is queued, then let the publishing
+    // thread drain into publishers that are still alive.
     if (client_) {
       client_->stop();
       client_->disconnect();
+    }
+    for (const auto& lane : lanes_) {
+      lane->stop();
     }
   }
 
@@ -91,6 +251,10 @@ class RsfNode : public rclcpp::Node {
     get("tf_decimation", config.tf_decimation);
     get("publish_lidar_rate_odom", config.publish_lidar_rate_odom);
     get("queue_size", config.queue_size);
+    get("publish_queue_size", config.publish_queue_size);
+    get("publish_text_on_change_only", config.publish_text_on_change_only);
+    get("text_keepalive_hz", config.text_keepalive_hz);
+    get("odom_decimation", config.odom_decimation);
     get("diagnostic_status_name", config.diagnostic_status_name);
     get("enable_set_ip_address", config.enable_set_ip_address);
 
@@ -148,6 +312,28 @@ class RsfNode : public rclcpp::Node {
     }
   }
 
+  // One lane per topic, so that a topic whose subscriber has fallen behind
+  // cannot hold up any other topic. The 1 kHz streams get their own lanes
+  // because they are the ones a slow consumer stalls first; the low rate topics
+  // share lanes, since they cannot fill one between them.
+  void createPublishLanes() {
+    const auto capacity = static_cast<std::size_t>(config_.publish_queue_size);
+    const auto lane = [this, capacity](const char* name) {
+      lanes_.push_back(std::make_unique<PublishLane>(name, capacity));
+      return lanes_.back().get();
+    };
+
+    cloud_lane_ = lane("point_cloud");
+    imu_lane_ = lane("imu");
+    lio_odom_lane_ = lane("lio_odom");
+    switch_odom_lane_ = lane("switch_odom");
+    utm_odom_lane_ = lane("utm_odom");
+    fix_lane_ = lane("nav_sat_fix");
+    tf_lane_ = lane("tf");
+    lidar_rate_lane_ = lane("lidar_rate_odom");
+    slow_lane_ = lane("gnss_text_diagnostics");
+  }
+
   void createSubscriptions() {
     // Commands are latched so that one sent before the node is up still arrives.
     rclcpp::QoS command_qos(rclcpp::KeepLast(10));
@@ -192,29 +378,73 @@ class RsfNode : public rclcpp::Node {
 
   // ******************** Sensor data ********************
 
+  // Builds the message here, on the receive thread, and publishes it on the
+  // publishing thread. Only the publish is deferred, so message order per topic
+  // is preserved.
+  template <typename PublisherT, typename MsgT>
+  void enqueue(PublishLane* lane, const PublisherT& publisher, std::unique_ptr<MsgT> msg) {
+    lane->post([publisher, message = std::move(msg)]() mutable {
+      publisher->publish(std::move(*message));
+    });
+  }
+
+  // True once per `odom_decimation` samples of this source.
+  //
+  // Counted rather than timed: the 1 kHz streams arrive in bursts of about
+  // fifty, so gating on elapsed wall-clock time discards most of each burst and
+  // caps the output near 180 Hz no matter what rate is asked for.
+  bool shouldPublishOdometry(rsf::DataType source) {
+    if (config_.odom_decimation <= 1) {
+      return true;
+    }
+    const auto index = static_cast<std::size_t>(source);
+    if (index >= odom_counter_.size()) {
+      return true;
+    }
+
+    unsigned& counter = odom_counter_[index];
+    if (++counter < static_cast<unsigned>(config_.odom_decimation)) {
+      return false;
+    }
+    counter = 0;
+    return true;
+  }
+
   void onOdometry(const rsf::Odometry& odometry) {
-    nav_msgs::msg::Odometry msg;
+    // Recorded before the rate cap, so the cloud is still paired with the most
+    // recent pose rather than the most recently published one.
+    if (odometry.source == rsf::DataType::kLioOdom && lidar_rate_odom_pub_) {
+      std::lock_guard<std::mutex> lock(latest_lio_mutex_);
+      latest_lio_odom_ = odometry;
+      has_latest_lio_odom_ = true;
+    }
+
+    // TF has its own decimation and its own consumers, so it is driven from
+    // every sample rather than from the ones that survive the cap.
+    if (odometry.source == rsf::DataType::kSwitchOdom) {
+      broadcastTf(odometry);
+    }
+
+    if (!shouldPublishOdometry(odometry.source)) {
+      return;
+    }
+
+    auto msg = std::make_unique<nav_msgs::msg::Odometry>();
 
     switch (odometry.source) {
       case rsf::DataType::kUtmOdom:
-        rsf_ros::toOdometryMsg(odometry, config_.frames.utm, config_.frames.lidar, msg);
-        utm_odom_pub_->publish(msg);
+        rsf_ros::toOdometryMsg(odometry, config_.frames.utm, config_.frames.lidar, *msg);
+        enqueue(utm_odom_lane_, utm_odom_pub_, std::move(msg));
         return;
 
       case rsf::DataType::kSwitchOdom:
-        rsf_ros::toOdometryMsg(odometry, config_.frames.odom, config_.frames.lidar, msg);
-        switch_odom_pub_->publish(msg);
-        broadcastTf(odometry);
+        rsf_ros::toOdometryMsg(odometry, config_.frames.odom, config_.frames.lidar, *msg);
+        enqueue(switch_odom_lane_, switch_odom_pub_, std::move(msg));
         return;
 
       case rsf::DataType::kLioOdom:
-        rsf_ros::toOdometryMsg(odometry, config_.frames.odom, config_.frames.lidar, msg);
-        lio_odom_pub_->publish(msg);
-        if (lidar_rate_odom_pub_) {
-          std::lock_guard<std::mutex> lock(latest_lio_mutex_);
-          latest_lio_odom_ = odometry;
-          has_latest_lio_odom_ = true;
-        }
+        rsf_ros::toOdometryMsg(odometry, config_.frames.odom, config_.frames.lidar, *msg);
+        enqueue(lio_odom_lane_, lio_odom_pub_, std::move(msg));
         return;
 
       default:
@@ -233,15 +463,17 @@ class RsfNode : public rclcpp::Node {
     }
     tf_counter_ = 0;
 
-    geometry_msgs::msg::TransformStamped transform;
-    rsf_ros::toTransformMsg(odometry, config_.frames.odom, config_.frames.lidar, transform);
-    tf_broadcaster_->sendTransform(transform);
+    auto transform = std::make_unique<geometry_msgs::msg::TransformStamped>();
+    rsf_ros::toTransformMsg(odometry, config_.frames.odom, config_.frames.lidar, *transform);
+    tf_lane_->post([this, t = std::move(transform)]() mutable {
+      tf_broadcaster_->sendTransform(*t);
+    });
   }
 
   void onPointCloud(const rsf::PointCloud& cloud) {
-    sensor_msgs::msg::PointCloud2 msg;
-    rsf_ros::toPointCloud2Msg(cloud, config_.frames.lidar, msg);
-    point_cloud_pub_->publish(msg);
+    auto msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+    rsf_ros::toPointCloud2Msg(cloud, config_.frames.lidar, *msg);
+    enqueue(cloud_lane_, point_cloud_pub_, std::move(msg));
 
     if (!lidar_rate_odom_pub_) {
       return;
@@ -258,61 +490,98 @@ class RsfNode : public rclcpp::Node {
       odometry = latest_lio_odom_;
     }
 
-    nav_msgs::msg::Odometry odometry_msg;
-    rsf_ros::toOdometryMsg(odometry, config_.frames.odom, config_.frames.lidar, odometry_msg);
-    lidar_rate_odom_pub_->publish(odometry_msg);
+    auto odometry_msg = std::make_unique<nav_msgs::msg::Odometry>();
+    rsf_ros::toOdometryMsg(odometry, config_.frames.odom, config_.frames.lidar, *odometry_msg);
+    enqueue(lidar_rate_lane_, lidar_rate_odom_pub_, std::move(odometry_msg));
   }
 
   void onImu(const rsf::Imu& imu) {
-    sensor_msgs::msg::Imu msg;
-    rsf_ros::toImuMsg(imu, config_.frames.imu, msg);
-    imu_pub_->publish(msg);
+    auto msg = std::make_unique<sensor_msgs::msg::Imu>();
+    rsf_ros::toImuMsg(imu, config_.frames.imu, *msg);
+    enqueue(imu_lane_, imu_pub_, std::move(msg));
   }
 
   void onNavSatFix(const rsf::NavSatFix& fix) {
-    sensor_msgs::msg::NavSatFix msg;
-    rsf_ros::toNavSatFixMsg(fix, config_.frames.gnss, msg);
+    auto msg = std::make_unique<sensor_msgs::msg::NavSatFix>();
+    rsf_ros::toNavSatFixMsg(fix, config_.frames.gnss, *msg);
     if (fix.source == rsf::DataType::kSwitchFix) {
-      switch_fix_pub_->publish(msg);
+      enqueue(fix_lane_, switch_fix_pub_, std::move(msg));
     } else {
-      fix_pub_->publish(msg);
+      enqueue(fix_lane_, fix_pub_, std::move(msg));
     }
   }
 
   void onGga(const rsf::GgaSentence& gga) {
-    nmea_msgs::msg::Gpgga msg;
-    rsf_ros::toGpggaMsg(gga, config_.frames.gnss, msg);
-    gga_pub_->publish(msg);
+    auto msg = std::make_unique<nmea_msgs::msg::Gpgga>();
+    rsf_ros::toGpggaMsg(gga, config_.frames.gnss, *msg);
+    enqueue(slow_lane_, gga_pub_, std::move(msg));
   }
 
   void onRmc(const rsf::RmcSentence& rmc) {
-    nmea_msgs::msg::Gprmc msg;
-    rsf_ros::toGprmcMsg(rmc, config_.frames.gnss, msg);
-    rmc_pub_->publish(msg);
+    auto msg = std::make_unique<nmea_msgs::msg::Gprmc>();
+    rsf_ros::toGprmcMsg(rmc, config_.frames.gnss, *msg);
+    enqueue(slow_lane_, rmc_pub_, std::move(msg));
   }
 
   void onZda(const rsf::ZdaSentence& zda) {
-    nmea_msgs::msg::Gpzda msg;
-    rsf_ros::toGpzdaMsg(zda, config_.frames.gnss, msg);
-    zda_pub_->publish(msg);
+    auto msg = std::make_unique<nmea_msgs::msg::Gpzda>();
+    rsf_ros::toGpzdaMsg(zda, config_.frames.gnss, *msg);
+    enqueue(slow_lane_, zda_pub_, std::move(msg));
+  }
+
+  // The four state/type strings arrive at 1 kHz each but describe a state that
+  // changes every few seconds, so forwarding all 4000 a second is almost pure
+  // overhead. Unless told otherwise, publish when the text changes and
+  // otherwise only often enough that a subscriber joining late still gets the
+  // current value promptly.
+  bool shouldPublishText(rsf::DataType source, const std::string& text) {
+    if (!config_.publish_text_on_change_only) {
+      return true;
+    }
+    const auto index = static_cast<std::size_t>(source);
+    if (index >= last_text_.size()) {
+      return true;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    TextState& state = last_text_[index];
+    if (state.valid && state.text == text) {
+      if (config_.text_keepalive_hz <= 0.0) {
+        return false;
+      }
+      const auto period =
+          std::chrono::duration<double>(1.0 / config_.text_keepalive_hz);
+      if (now - state.sent < std::chrono::duration_cast<std::chrono::steady_clock::duration>(period)) {
+        return false;
+      }
+    }
+
+    state.text = text;
+    state.valid = true;
+    state.sent = now;
+    return true;
   }
 
   void onTextStatus(const rsf::TextStatus& status) {
-    std_msgs::msg::String msg;
-    rsf_ros::toStringMsg(status.text, msg);
+    if (!shouldPublishText(status.source, status.text)) {
+      return;
+    }
+
+    auto msg = std::make_unique<std_msgs::msg::String>();
+    rsf_ros::toStringMsg(status.text, *msg);
 
     switch (status.source) {
       case rsf::DataType::kSwitchOdomState:
-        switch_odom_state_pub_->publish(msg);
+        enqueue(slow_lane_, switch_odom_state_pub_, std::move(msg));
         break;
       case rsf::DataType::kSwitchOdomType:
-        switch_odom_type_pub_->publish(msg);
+        enqueue(slow_lane_, switch_odom_type_pub_, std::move(msg));
         break;
       case rsf::DataType::kSwitchFixState:
-        switch_fix_state_pub_->publish(msg);
+        enqueue(slow_lane_, switch_fix_state_pub_, std::move(msg));
         break;
       case rsf::DataType::kSwitchFixType:
-        switch_fix_type_pub_->publish(msg);
+        enqueue(slow_lane_, switch_fix_type_pub_, std::move(msg));
         break;
       default:
         break;
@@ -320,9 +589,24 @@ class RsfNode : public rclcpp::Node {
   }
 
   void onDiagnostics(const rsf::Diagnostics& diagnostics) {
-    diagnostic_msgs::msg::DiagnosticArray msg;
-    rsf_ros::toDiagnosticArrayMsg(diagnostics, config_.diagnostic_status_name, msg);
-    diagnostics_pub_->publish(msg);
+    auto msg = std::make_unique<diagnostic_msgs::msg::DiagnosticArray>();
+    rsf_ros::toDiagnosticArrayMsg(diagnostics, config_.diagnostic_status_name, *msg);
+    enqueue(slow_lane_, diagnostics_pub_, std::move(msg));
+  }
+
+  void reportDrops() {
+    for (const auto& lane : lanes_) {
+      const PublishLane::Report report = lane->takeReport();
+      if (report.dropped_since == 0) {
+        continue;
+      }
+      RCLCPP_WARN(get_logger(),
+                  "topic '%s': %" PRIu64
+                  " samples discarded (queue %zu of %d, slowest publish %.0f ms). Its subscriber "
+                  "is not keeping up; other topics are unaffected.",
+                  report.name.c_str(), report.dropped_since, report.depth,
+                  config_.publish_queue_size, report.worst_publish_seconds * 1000.0);
+    }
   }
 
   void onLog(rsf::LogLevel level, const std::string& message) {
@@ -397,8 +681,34 @@ class RsfNode : public rclcpp::Node {
   rsf::Odometry latest_lio_odom_;
   bool has_latest_lio_odom_ = false;
 
+  struct TextState {
+    std::string text;
+    std::chrono::steady_clock::time_point sent{};
+    bool valid = false;
+  };
+  // Indexed by DataType; only the four state/type entries are ever used.
+  std::array<TextState, rsf::kMaxDataType + 1> last_text_;
+
+  // Indexed by DataType; only the three odometry entries are ever used.
+  std::array<unsigned, rsf::kMaxDataType + 1> odom_counter_{};
+
+  rclcpp::TimerBase::SharedPtr report_timer_;
+
+  // Declared after the publishers so that they are destroyed before them: a
+  // lane's thread must stop touching a publisher while it still exists.
+  std::vector<std::unique_ptr<PublishLane>> lanes_;
+  PublishLane* cloud_lane_ = nullptr;
+  PublishLane* imu_lane_ = nullptr;
+  PublishLane* lio_odom_lane_ = nullptr;
+  PublishLane* switch_odom_lane_ = nullptr;
+  PublishLane* utm_odom_lane_ = nullptr;
+  PublishLane* fix_lane_ = nullptr;
+  PublishLane* tf_lane_ = nullptr;
+  PublishLane* lidar_rate_lane_ = nullptr;
+  PublishLane* slow_lane_ = nullptr;
+
   // Declared last so that it is destroyed first, stopping the receive thread
-  // before the publishers it uses.
+  // before the queue it posts to.
   std::unique_ptr<rsf::Client> client_;
 };
 
