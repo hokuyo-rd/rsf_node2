@@ -66,10 +66,41 @@ struct DriverConfig {
   // "legacy" pin it. See the rsf_library README on why this exists.
   std::string wire_layout = "legacy";
 
+  // Which clock stamps the published messages.
+  //
+  // "sensor"  the timestamp the sensor put on the wire - the true acquisition
+  //           instant, correct when the sensor clock is synchronised here.
+  //
+  // "receive" the ROS clock: the sensor's timestamps moved onto it by one
+  //           continuously measured offset. Use this when the sensor clock is
+  //           not disciplined - without a GNSS fix this unit was measured about
+  //           0.7 s behind the PC, which no Nav2 costmap or transform tolerance
+  //           accepts.
+  //
+  //           The offset is shared by every stream on purpose. Stamping each
+  //           message with its own arrival time instead reorders the streams
+  //           against each other: the sensor stamps a cloud at acquisition,
+  //           before the odometry it goes on to produce, while arrival time puts
+  //           it after. Measured here, doing that took tf2 lookups on the point
+  //           cloud from 6 % failing to 99 %.
+  std::string stamp_source = "sensor";
+
   bool broadcast_tf = true;
-  // Odometry arrives at 1 kHz, which is far more than a TF tree needs.
-  // One transform is broadcast per this many odometry messages.
-  int tf_decimation = 50;
+  // One transform per this many odometry messages, so 2 gives 500 Hz out of the
+  // 1 kHz stream. Bounded from both sides, both measured on hardware:
+  //
+  //   too slow - tf2 interpolates but never extrapolates, so anything stamped
+  //   after the newest transform cannot be looked up. At 20 Hz, 6.4 % of point
+  //   cloud lookups failed.
+  //
+  //   too fast - /tf has RELIABLE subscribers, and past what they absorb the
+  //   publish lane discards transforms while each subscriber's tf2 listener
+  //   falls behind as well. At 1000 Hz the lane overflowed, the largest gap grew
+  //   from 0.004 s to 0.155 s, and failures rose to 10.9 %.
+  //
+  // 100 Hz (10) and 500 Hz (2) measured the same in between. 2 is chosen for the
+  // headroom; 10 costs slightly less on a CPU bound machine. Do not set 1.
+  int tf_decimation = 2;
 
   bool publish_lidar_rate_odom = true;
 
@@ -129,8 +160,18 @@ struct DriverConfig {
       client.parser.layout = rsf::legacyLayout();
       client.parser.auto_detect_layout = false;
     }
+
+    // Deliberately left at kSensor. The node does its own mapping onto the ROS
+    // clock, which honours use_sim_time; letting the library shift as well
+    // would apply the correction twice. The library's own stamp_source is for
+    // consumers that use it without ROS, such as rsf_driver and the recorder.
+    client.stamp_source = rsf::StampSource::kSensor;
     return client;
   }
+
+  // "offset" is accepted as a synonym: the correction has always been an offset,
+  // and the name says what it does rather than when it is measured.
+  bool useReceiveStamp() const { return stamp_source == "receive" || stamp_source == "offset"; }
 
   // Returns an empty string when the configuration is usable, or a description
   // of the problem otherwise.
@@ -143,6 +184,9 @@ struct DriverConfig {
     }
     if (wire_layout != "auto" && wire_layout != "spec" && wire_layout != "legacy") {
       return "wire_layout must be one of: auto, spec, legacy";
+    }
+    if (!useReceiveStamp() && stamp_source != "sensor") {
+      return "stamp_source must be one of: sensor, receive";
     }
     if (tf_decimation < 1) {
       return "tf_decimation must be at least 1";

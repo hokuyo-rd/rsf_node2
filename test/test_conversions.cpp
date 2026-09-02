@@ -311,6 +311,33 @@ void checkConversions(const char* flavour) {
     CHECK_NEAR(rsf::readF32(third + 12), 20.0, 1e-6);
     CHECK(rsf::readU32(third + 16) == 1774483202u);
     CHECK(rsf::readU32(third + 20) == 500u);
+
+    // Restamping onto another clock has to move the per-point times with the
+    // header. Leaving them behind would put two clocks in one message and
+    // silently wreck any motion compensation reading them.
+    PointCloud2<StampT> shifted;
+    const std::int64_t shift_ns = 700000000;  // +0.7 s, the offset measured here
+    rsf_ros::toPointCloud2Msg(cloud, "rsf_hokuyo3d", shifted, shift_ns);
+
+    const std::uint8_t* first = shifted.data.data();
+    CHECK(rsf::readU32(first + 16) == 1774483200u);
+    CHECK(rsf::readU32(first + 20) == 500u + 700000000u);
+
+    // The third point's nanoseconds carry into the next second.
+    const std::uint8_t* moved_third = shifted.data.data() + 2 * 24;
+    CHECK(rsf::readU32(moved_third + 16) == 1774483202u);
+    CHECK(rsf::readU32(moved_third + 20) == 700000500u);
+
+    // Everything that is not a timestamp survives the shift untouched.
+    CHECK_NEAR(rsf::readF32(moved_third + 0), 2.0, 1e-6);
+    CHECK_NEAR(rsf::readF32(moved_third + 12), 20.0, 1e-6);
+
+    // A shift that crosses a second boundary must carry properly.
+    PointCloud2<StampT> carried;
+    rsf_ros::toPointCloud2Msg(cloud, "rsf_hokuyo3d", carried, 1500000000);  // +1.5 s
+    const std::uint8_t* carried_first = carried.data.data();
+    CHECK(rsf::readU32(carried_first + 16) == 1774483201u);
+    CHECK(rsf::readU32(carried_first + 20) == 500000500u);
   }
 
   // --- Imu ---

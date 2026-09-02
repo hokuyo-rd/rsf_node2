@@ -198,6 +198,13 @@ class RsfNode : public rclcpp::Node {
       throw std::runtime_error(problem);
     }
 
+    if (config_.useReceiveStamp()) {
+      stamp_mode_ = StampMode::kReceive;
+      RCLCPP_INFO(get_logger(),
+                  "stamping on the ROS clock: the sensor's timestamps are moved onto it by "
+                  "one continuously measured offset, so the timing between streams is kept");
+    }
+
     createPublishers();
     createSubscriptions();
 
@@ -247,6 +254,7 @@ class RsfNode : public rclcpp::Node {
     get("start_streaming_on_connect", config.start_streaming_on_connect);
     get("start_rsf_on_connect", config.start_rsf_on_connect);
     get("wire_layout", config.wire_layout);
+    get("stamp_source", config.stamp_source);
     get("broadcast_tf", config.broadcast_tf);
     get("tf_decimation", config.tf_decimation);
     get("publish_lidar_rate_odom", config.publish_lidar_rate_odom);
@@ -381,6 +389,71 @@ class RsfNode : public rclcpp::Node {
   // Builds the message here, on the receive thread, and publishes it on the
   // publishing thread. Only the publish is deferred, so message order per topic
   // is preserved.
+  // Moves a sensor timestamp onto the ROS clock.
+  //
+  // Done here rather than taken from the library, even though rsf::Client can do
+  // the same: this node's now() follows the ROS clock and so honours
+  // use_sim_time, while the library only has the system clock.
+  //
+  // Every stream is shifted by the same estimate, which is what keeps a point
+  // cloud in the same relative position against the transforms as the sensor put
+  // it in. Stamping each message with its own arrival time instead reorders the
+  // streams against each other and breaks transform lookups.
+  rclcpp::Time mappedStamp(const rsf::Timestamp& sensor_stamp) {
+    const rclcpp::Time arrival = now();
+    if (sensor_stamp.isZero()) {
+      return arrival;  // nothing to shift
+    }
+
+    const auto sensor_ns = static_cast<std::int64_t>(sensor_stamp.toNanoseconds());
+    updateClockOffset(arrival.nanoseconds() - sensor_ns);
+    const std::int64_t shifted = sensor_ns + clock_offset_ns_;
+    return rclcpp::Time(shifted > 0 ? shifted : 0, arrival.get_clock_type());
+  }
+
+  // Smallest (arrival - sensor stamp) per window: transport latency only adds to
+  // that difference, so the minimum sits closest to the true offset. Eased
+  // between windows so published stamps stay monotonic, but followed at once
+  // when the step is large enough to be a clock being set rather than drift.
+  void updateClockOffset(std::int64_t sample) {
+    if (!clock_offset_valid_) {
+      clock_offset_ns_ = sample;
+      offset_window_min_ = sample;
+      offset_window_start_ = std::chrono::steady_clock::now();
+      clock_offset_valid_ = true;
+      return;
+    }
+    if (sample < offset_window_min_) {
+      offset_window_min_ = sample;
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - offset_window_start_;
+    if (elapsed < std::chrono::seconds(1)) {
+      return;
+    }
+
+    constexpr std::int64_t kJumpNs = 100000000;  // 100 ms: a clock was set
+    constexpr std::int64_t kSlewNs = 2000000;    // otherwise ease by 2 ms
+    const std::int64_t delta = offset_window_min_ - clock_offset_ns_;
+    if (delta > kJumpNs || delta < -kJumpNs) {
+      clock_offset_ns_ = offset_window_min_;
+    } else if (delta > kSlewNs) {
+      clock_offset_ns_ += kSlewNs;
+    } else if (delta < -kSlewNs) {
+      clock_offset_ns_ -= kSlewNs;
+    } else {
+      clock_offset_ns_ = offset_window_min_;
+    }
+    offset_window_min_ = sample;
+    offset_window_start_ = std::chrono::steady_clock::now();
+  }
+
+  template <typename MsgT>
+  void applyStamp(MsgT& msg, const rsf::Timestamp& sensor_stamp) {
+    if (stamp_mode_ != StampMode::kSensor) {
+      msg.header.stamp = mappedStamp(sensor_stamp);
+    }
+  }
+
   template <typename PublisherT, typename MsgT>
   void enqueue(PublishLane* lane, const PublisherT& publisher, std::unique_ptr<MsgT> msg) {
     lane->post([publisher, message = std::move(msg)]() mutable {
@@ -434,16 +507,19 @@ class RsfNode : public rclcpp::Node {
     switch (odometry.source) {
       case rsf::DataType::kUtmOdom:
         rsf_ros::toOdometryMsg(odometry, config_.frames.utm, config_.frames.lidar, *msg);
+        applyStamp(*msg, odometry.sensor_stamp);
         enqueue(utm_odom_lane_, utm_odom_pub_, std::move(msg));
         return;
 
       case rsf::DataType::kSwitchOdom:
         rsf_ros::toOdometryMsg(odometry, config_.frames.odom, config_.frames.lidar, *msg);
+        applyStamp(*msg, odometry.sensor_stamp);
         enqueue(switch_odom_lane_, switch_odom_pub_, std::move(msg));
         return;
 
       case rsf::DataType::kLioOdom:
         rsf_ros::toOdometryMsg(odometry, config_.frames.odom, config_.frames.lidar, *msg);
+        applyStamp(*msg, odometry.sensor_stamp);
         enqueue(lio_odom_lane_, lio_odom_pub_, std::move(msg));
         return;
 
@@ -465,6 +541,7 @@ class RsfNode : public rclcpp::Node {
 
     auto transform = std::make_unique<geometry_msgs::msg::TransformStamped>();
     rsf_ros::toTransformMsg(odometry, config_.frames.odom, config_.frames.lidar, *transform);
+    applyStamp(*transform, odometry.sensor_stamp);
     tf_lane_->post([this, t = std::move(transform)]() mutable {
       tf_broadcaster_->sendTransform(*t);
     });
@@ -472,7 +549,19 @@ class RsfNode : public rclcpp::Node {
 
   void onPointCloud(const rsf::PointCloud& cloud) {
     auto msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
-    rsf_ros::toPointCloud2Msg(cloud, config_.frames.lidar, *msg);
+
+    // Each point carries its own acquisition time, which motion compensation
+    // reads alongside the header. Work out how far the header is about to move
+    // and move the points with it, or the one message would describe two clocks.
+    std::int64_t point_shift_ns = 0;
+    if (stamp_mode_ != StampMode::kSensor) {
+      const rclcpp::Time mapped = mappedStamp(cloud.sensor_stamp);
+      point_shift_ns =
+          mapped.nanoseconds() - static_cast<std::int64_t>(cloud.stamp.toNanoseconds());
+    }
+
+    rsf_ros::toPointCloud2Msg(cloud, config_.frames.lidar, *msg, point_shift_ns);
+    applyStamp(*msg, cloud.sensor_stamp);
     enqueue(cloud_lane_, point_cloud_pub_, std::move(msg));
 
     if (!lidar_rate_odom_pub_) {
@@ -492,18 +581,21 @@ class RsfNode : public rclcpp::Node {
 
     auto odometry_msg = std::make_unique<nav_msgs::msg::Odometry>();
     rsf_ros::toOdometryMsg(odometry, config_.frames.odom, config_.frames.lidar, *odometry_msg);
+    applyStamp(*odometry_msg, odometry.sensor_stamp);
     enqueue(lidar_rate_lane_, lidar_rate_odom_pub_, std::move(odometry_msg));
   }
 
   void onImu(const rsf::Imu& imu) {
     auto msg = std::make_unique<sensor_msgs::msg::Imu>();
     rsf_ros::toImuMsg(imu, config_.frames.imu, *msg);
+    applyStamp(*msg, imu.sensor_stamp);
     enqueue(imu_lane_, imu_pub_, std::move(msg));
   }
 
   void onNavSatFix(const rsf::NavSatFix& fix) {
     auto msg = std::make_unique<sensor_msgs::msg::NavSatFix>();
     rsf_ros::toNavSatFixMsg(fix, config_.frames.gnss, *msg);
+    applyStamp(*msg, fix.sensor_stamp);
     if (fix.source == rsf::DataType::kSwitchFix) {
       enqueue(fix_lane_, switch_fix_pub_, std::move(msg));
     } else {
@@ -514,18 +606,21 @@ class RsfNode : public rclcpp::Node {
   void onGga(const rsf::GgaSentence& gga) {
     auto msg = std::make_unique<nmea_msgs::msg::Gpgga>();
     rsf_ros::toGpggaMsg(gga, config_.frames.gnss, *msg);
+    applyStamp(*msg, gga.sensor_stamp);
     enqueue(slow_lane_, gga_pub_, std::move(msg));
   }
 
   void onRmc(const rsf::RmcSentence& rmc) {
     auto msg = std::make_unique<nmea_msgs::msg::Gprmc>();
     rsf_ros::toGprmcMsg(rmc, config_.frames.gnss, *msg);
+    applyStamp(*msg, rmc.sensor_stamp);
     enqueue(slow_lane_, rmc_pub_, std::move(msg));
   }
 
   void onZda(const rsf::ZdaSentence& zda) {
     auto msg = std::make_unique<nmea_msgs::msg::Gpzda>();
     rsf_ros::toGpzdaMsg(zda, config_.frames.gnss, *msg);
+    applyStamp(*msg, zda.sensor_stamp);
     enqueue(slow_lane_, zda_pub_, std::move(msg));
   }
 
@@ -591,6 +686,7 @@ class RsfNode : public rclcpp::Node {
   void onDiagnostics(const rsf::Diagnostics& diagnostics) {
     auto msg = std::make_unique<diagnostic_msgs::msg::DiagnosticArray>();
     rsf_ros::toDiagnosticArrayMsg(diagnostics, config_.diagnostic_status_name, *msg);
+    applyStamp(*msg, diagnostics.sensor_stamp);
     enqueue(slow_lane_, diagnostics_pub_, std::move(msg));
   }
 
@@ -653,6 +749,15 @@ class RsfNode : public rclcpp::Node {
   // ******************** State ********************
 
   rsf_ros::DriverConfig config_;
+
+  enum class StampMode { kSensor, kReceive };
+  // Cached from config_: this is consulted for every published message.
+  StampMode stamp_mode_ = StampMode::kSensor;
+
+  std::int64_t clock_offset_ns_ = 0;
+  bool clock_offset_valid_ = false;
+  std::int64_t offset_window_min_ = 0;
+  std::chrono::steady_clock::time_point offset_window_start_{};
 
   rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr fix_pub_;
   rclcpp::Publisher<nmea_msgs::msg::Gpgga>::SharedPtr gga_pub_;

@@ -109,10 +109,70 @@ constexpr bool kPointIsBitwiseCompatible =
     offsetof(rsf::PointXYZIT, sec) == kOffsetSec && offsetof(rsf::PointXYZIT, nsec) == kOffsetNsec;
 }  // namespace point_layout
 
+
+namespace detail {
+
+// One point's acquisition time, moved by `shift_ns`.
+inline void shiftedPointTime(const rsf::PointXYZIT& point, std::int64_t shift_ns,
+                             std::uint32_t& sec, std::uint32_t& nsec) {
+  if (shift_ns == 0) {
+    sec = point.sec;
+    nsec = point.nsec;
+    return;
+  }
+  constexpr std::int64_t kNanosPerSecond = 1000000000;
+  const std::int64_t moved =
+      static_cast<std::int64_t>(point.sec) * kNanosPerSecond + point.nsec + shift_ns;
+  const std::int64_t safe = moved > 0 ? moved : 0;
+  sec = static_cast<std::uint32_t>(safe / kNanosPerSecond);
+  nsec = static_cast<std::uint32_t>(safe % kNanosPerSecond);
+}
+
+}  // namespace detail
+
+// Field by field, used whenever the block copy cannot be.
+template <typename PointCloud2Msg>
+void writePoints(const rsf::PointCloud& cloud, std::int64_t shift_ns, PointCloud2Msg& msg) {
+  std::uint8_t* cursor = msg.data.data();
+  for (const rsf::PointXYZIT& point : cloud.points) {
+    std::uint32_t sec = 0;
+    std::uint32_t nsec = 0;
+    detail::shiftedPointTime(point, shift_ns, sec, nsec);
+    rsf::writeF32(cursor + point_layout::kOffsetX, point.x);
+    rsf::writeF32(cursor + point_layout::kOffsetY, point.y);
+    rsf::writeF32(cursor + point_layout::kOffsetZ, point.z);
+    rsf::writeF32(cursor + point_layout::kOffsetIntensity, point.intensity);
+    rsf::writeU32(cursor + point_layout::kOffsetSec, sec);
+    rsf::writeU32(cursor + point_layout::kOffsetNsec, nsec);
+    cursor += point_layout::kPointStep;
+  }
+}
+
+// Rewrites only the two time fields, after a block copy has laid down the rest.
+template <typename PointCloud2Msg>
+void writePointTimes(const rsf::PointCloud& cloud, std::int64_t shift_ns, PointCloud2Msg& msg) {
+  if (shift_ns == 0) {
+    return;  // the copy already carries the right values
+  }
+  std::uint8_t* cursor = msg.data.data();
+  for (const rsf::PointXYZIT& point : cloud.points) {
+    std::uint32_t sec = 0;
+    std::uint32_t nsec = 0;
+    detail::shiftedPointTime(point, shift_ns, sec, nsec);
+    rsf::writeU32(cursor + point_layout::kOffsetSec, sec);
+    rsf::writeU32(cursor + point_layout::kOffsetNsec, nsec);
+    cursor += point_layout::kPointStep;
+  }
+}
+
 // sensor_msgs/PointCloud2 with fields x, y, z, intensity, sec, nsec.
+// `point_time_shift_ns` moves each point's own acquisition time by the same
+// amount the header was moved, for a caller that restamps onto another clock.
+// Leaving the header on one clock and the points on another would make the
+// message describe two, which breaks per-point motion compensation.
 template <typename PointCloud2Msg>
 void toPointCloud2Msg(const rsf::PointCloud& cloud, const std::string& frame_id,
-                      PointCloud2Msg& msg) {
+                      PointCloud2Msg& msg, std::int64_t point_time_shift_ns = 0) {
   fillHeader(cloud.stamp, frame_id, msg.header);
 
   msg.height = 1;
@@ -144,20 +204,17 @@ void toPointCloud2Msg(const rsf::PointCloud& cloud, const std::string& frame_id,
   msg.data.resize(static_cast<std::size_t>(msg.row_step));
 
   if (!cloud.points.empty()) {
+    // The block copy is only valid while the points go out untouched.
     if constexpr (point_layout::kPointIsBitwiseCompatible) {
-      std::memcpy(msg.data.data(), cloud.points.data(),
-                  cloud.points.size() * point_layout::kPointStep);
-    } else {
-      std::uint8_t* cursor = msg.data.data();
-      for (const rsf::PointXYZIT& point : cloud.points) {
-        rsf::writeF32(cursor + point_layout::kOffsetX, point.x);
-        rsf::writeF32(cursor + point_layout::kOffsetY, point.y);
-        rsf::writeF32(cursor + point_layout::kOffsetZ, point.z);
-        rsf::writeF32(cursor + point_layout::kOffsetIntensity, point.intensity);
-        rsf::writeU32(cursor + point_layout::kOffsetSec, point.sec);
-        rsf::writeU32(cursor + point_layout::kOffsetNsec, point.nsec);
-        cursor += point_layout::kPointStep;
+      if (point_time_shift_ns == 0) {
+        std::memcpy(msg.data.data(), cloud.points.data(),
+                    cloud.points.size() * point_layout::kPointStep);
+        writePointTimes(cloud, 0, msg);
+      } else {
+        writePoints(cloud, point_time_shift_ns, msg);
       }
+    } else {
+      writePoints(cloud, point_time_shift_ns, msg);
     }
   }
 
