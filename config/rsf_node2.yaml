@@ -31,6 +31,22 @@ rsf_node:
     #           per-point timestamps inside the cloud move with the header.
     stamp_source: "receive"
 
+    # Which clock stamps the published messages.
+    #
+    # "sensor"  the timestamp the sensor put on the wire - the true acquisition
+    #           instant, correct when the sensor clock is synchronised here.
+    #
+    # "receive" the ROS clock: the sensor's timestamps moved onto it by one
+    #           continuously measured offset. Use this when the sensor clock is
+    #           not disciplined - without a GNSS fix this unit ran about 0.7 s
+    #           behind the PC, which no Nav2 costmap (expected_update_rate 0.08)
+    #           or transform_tolerance (0.1-0.2) accepts.
+    #
+    #           The offset is shared by every stream on purpose, so the timing
+    #           between them is left exactly as the sensor reported it, and the
+    #           per-point timestamps inside the cloud move with the header.
+    stamp_source: "receive"
+
     # Publisher queue depth. The 1 kHz streams need more than the usual 10.
     queue_size: 100
 
@@ -55,10 +71,37 @@ rsf_node:
     # most of each burst and lands near 180 Hz whatever rate is asked for.
     # Applies to lio_odom, switch_odom and utm_odom; TF has tf_decimation and
     # IMU is left alone.
-    odom_decimation: 2
+    odom_decimation: 1
 
     # ---- TF ----
     broadcast_tf: true
+    # One transform per this many odometry messages, so 2 gives 500 Hz out of
+    # the 1 kHz stream. Bounded from both sides, both measured on hardware with
+    # the sample launch running:
+    #
+    #   too slow  tf2 interpolates but never extrapolates, so anything stamped
+    #             after the newest transform cannot be looked up, and the window
+    #             for that is one TF period. At 20 Hz (50), 6.4 % of point cloud
+    #             lookups failed with the clouds genuinely ahead of the newest
+    #             transform.
+    #
+    #   too fast  /tf has RELIABLE subscribers - RViz, and vizanti here - and
+    #             past what they absorb two things go wrong: the publish lane
+    #             discards transforms, and each subscriber's own tf2 listener
+    #             falls behind so its buffer lags what was actually published.
+    #             At 1000 Hz (1) the tf lane overflowed, the largest gap grew
+    #             from 0.004 s to 0.155 s, and failures rose to 10.9 %.
+    #
+    # Between those, 100 Hz (10) and 500 Hz (2) measured the same: 0.1 % on a
+    # quiet machine, ~2 % when CPU is contended, with the difference between
+    # runs larger than the difference between settings. 2 is chosen for the
+    # headroom - it also covers a consumer doing timestamped lookups at any rate
+    # up to 500 Hz. Use 10 instead if nothing needs more than 100 Hz and the
+    # machine is CPU bound; it costs a little less. Do not set 1.
+    #
+    # Crossing the upper bound announces itself: the node logs
+    # "topic 'tf': N samples discarded".
+    tf_decimation: 2
     # One transform per this many odometry messages, so 2 gives 500 Hz out of
     # the 1 kHz stream. Bounded from both sides, both measured on hardware with
     # the sample launch running:
